@@ -8,7 +8,6 @@ use anyhow::{Result, bail};
 use serde_json::json;
 use uuid::Uuid;
 
-use crate::account::api::PROTOCOL_VERSION;
 use crate::media::ConnectionMediaProfile;
 use crate::protocol::capability::{CodecCapability, DeviceCapability};
 
@@ -247,7 +246,8 @@ fn encode_connect_options(
     // during display initialization, before the later ECHO replacement.
     let feature_flag = crate::features::stream_control::encode_read_only_feature_flags();
     push_bytes_field(&mut options, 11, &feature_flag);
-    push_bytes_field(&mut options, 12, PROTOCOL_VERSION.as_bytes());
+    let protocol_version = crate::protocol::official_version::client();
+    push_bytes_field(&mut options, 12, protocol_version.as_bytes());
     Ok(options)
 }
 

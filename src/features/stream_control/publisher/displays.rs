@@ -336,6 +336,21 @@ pub(crate) async fn receive_session(
                         ),
                     ));
                 }
+                Some(PbRpcRequestPayload::UserEntitlementSync(request)) => {
+                    anyhow::ensure!(header.is_some(), "权益同步缺少请求头");
+                    tracing::debug!(
+                        bytes = request.entitlement_data.len(),
+                        server_time = request.current_server_time,
+                        "host acknowledged controller entitlement sync"
+                    );
+                    return Ok(response(
+                        &message,
+                        header,
+                        PbRpcResponsePayload::UserEntitlementSyncRsp(
+                            super::super::wire::PbEntitlementSyncResponse { error_code: 0 },
+                        ),
+                    ));
+                }
                 Some(PbRpcRequestPayload::MouseSwitch(bytes)) => {
                     #[derive(Clone, PartialEq, prost::Message)]
                     struct Switch {

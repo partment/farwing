@@ -6,7 +6,8 @@
 
 use std::{
     fmt,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    sync::OnceLock,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crate::account::nrd_http::RetryPolicy;
@@ -14,7 +15,7 @@ use anyhow::{Context, Result, bail};
 use hmac::{Hmac, Mac};
 use reqwest::{
     Method as HttpMethod,
-    header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue},
+    header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, LOCATION},
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::Sha256;
@@ -27,6 +28,25 @@ const SIGNING_KEY: &[u8] = b"alWiSzXZTLu3WfFnw13uBru3";
 const PACKAGE_NAME: &str = "com.netease.uuremote";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const LONG_POLL_TIMEOUT: Duration = Duration::from_secs(65);
+const RELEASE_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
+const RELEASE_REFRESH_INTERVAL: Duration = Duration::from_secs(6 * 3600);
+const RELEASE_RETRY_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const RELEASE_FORCE_COOLDOWN: Duration = Duration::from_secs(30);
+
+#[derive(Default)]
+struct VersionRefreshState {
+    next_check: Option<Instant>,
+    last_forced: Option<Instant>,
+}
+
+fn version_refresh_lock() -> &'static tokio::sync::Mutex<VersionRefreshState> {
+    static STATE: OnceLock<tokio::sync::Mutex<VersionRefreshState>> = OnceLock::new();
+    STATE.get_or_init(|| tokio::sync::Mutex::new(VersionRefreshState::default()))
+}
+
+fn is_version_too_low(code: i32, msg: &str) -> bool {
+    code == 2007 || msg.contains("版本较低") || msg.contains("版本过低")
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum IdentityScope {
@@ -728,7 +748,6 @@ impl fmt::Debug for RoomSession {
 pub struct NrdApi {
     http: crate::account::nrd_http::NrdHttp,
     identity: ClientIdentity,
-    version_name: String,
     channel: String,
     user_id: Option<String>,
     guest_id: Option<String>,
@@ -741,7 +760,6 @@ impl NrdApi {
         Ok(Self {
             http,
             identity,
-            version_name: PROTOCOL_VERSION.to_owned(),
             channel: DEFAULT_CHANNEL.to_owned(),
             user_id: None,
             guest_id: None,
@@ -1027,6 +1045,71 @@ impl NrdApi {
         self.send(contract, path, body).await
     }
 
+    async fn ensure_client_version(&self, force: bool) {
+        let mut state = version_refresh_lock().lock().await;
+        let now = Instant::now();
+        if force {
+            if state
+                .last_forced
+                .is_some_and(|t| now.saturating_duration_since(t) < RELEASE_FORCE_COOLDOWN)
+            {
+                return;
+            }
+        } else if state.next_check.is_some_and(|t| now < t) {
+            return;
+        }
+        let path = format!("/api/v1/release/dl/1?channel={}", self.channel);
+        let outcome = self
+            .http
+            .send(
+                HttpMethod::HEAD,
+                &path,
+                HeaderMap::new(),
+                Vec::new(),
+                RELEASE_CHECK_TIMEOUT,
+                RetryPolicy::Replayable,
+            )
+            .await;
+        let completed = Instant::now();
+        if force {
+            state.last_forced = Some(completed);
+        }
+        match outcome {
+            Ok((status, _, headers)) if status.is_redirection() => {
+                let parsed = headers
+                    .get(LOCATION)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(crate::protocol::official_version::parse_release_redirect);
+                if let Some(version) = parsed {
+                    if crate::protocol::official_version::update_client(&version) {
+                        tracing::info!(
+                            %version,
+                            "adopted newer official client version from release redirect"
+                        );
+                    }
+                    state.next_check = Some(completed + RELEASE_REFRESH_INTERVAL);
+                } else {
+                    tracing::debug!(
+                        %status,
+                        "official release redirect did not carry a usable client version"
+                    );
+                    state.next_check = Some(completed + RELEASE_RETRY_INTERVAL);
+                }
+            }
+            Ok((status, _, _)) => {
+                tracing::debug!(
+                    %status,
+                    "official release redirect returned unexpected HTTP status"
+                );
+                state.next_check = Some(completed + RELEASE_RETRY_INTERVAL);
+            }
+            Err(error) => {
+                tracing::debug!(%error, "official release version lookup failed; using baseline");
+                state.next_check = Some(completed + RELEASE_RETRY_INTERVAL);
+            }
+        }
+    }
+
     async fn send<T>(&self, contract: Contract, path: &str, body: Vec<u8>) -> Result<ApiEnvelope<T>>
     where
         T: DeserializeOwned,
@@ -1040,35 +1123,64 @@ impl NrdApi {
             Method::Put => HttpMethod::PUT,
             Method::Delete => HttpMethod::DELETE,
         };
-        let mut headers = self.signed_headers(method.as_str(), path, &body, contract.identity)?;
-        if contract.json_content_type {
-            headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        }
-        if contract.identity == IdentityScope::AccountDevice
-            && let Some(value) = &self.authorization
-        {
-            headers.insert(AUTHORIZATION, value.clone());
-        }
-        let (status, bytes) = self
-            .http
-            .send(
-                method,
+        self.ensure_client_version(false).await;
+        let mut retried_version = false;
+        let (status, code, envelope) = loop {
+            let sent_version = crate::protocol::official_version::client();
+            let mut headers = self.signed_headers(
+                &sent_version,
+                method.as_str(),
                 path,
-                headers,
-                body,
-                contract.timeout,
-                contract.retry,
-            )
-            .await?;
-        let envelope: ApiEnvelope<serde_json::Value> = serde_json::from_slice(&bytes)
-            .with_context(|| format!("failed to decode NRD API JSON response (HTTP {status})"))?;
-        // Official response consumers classify HTTP/business status before
-        // deserializing success data. A revoked device returns data={} rather
-        // than DeviceList; that must not hide its 1120 behind a missing field.
-        let code = if status != reqwest::StatusCode::OK && envelope.code == 0 {
-            i32::from(status.as_u16())
-        } else {
-            envelope.code
+                &body,
+                contract.identity,
+            )?;
+            if contract.json_content_type {
+                headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+            }
+            if contract.identity == IdentityScope::AccountDevice
+                && let Some(value) = &self.authorization
+            {
+                headers.insert(AUTHORIZATION, value.clone());
+            }
+            let (status, bytes, _) = self
+                .http
+                .send(
+                    method.clone(),
+                    path,
+                    headers,
+                    body.clone(),
+                    contract.timeout,
+                    contract.retry,
+                )
+                .await?;
+            let envelope: ApiEnvelope<serde_json::Value> = serde_json::from_slice(&bytes)
+                .with_context(|| {
+                    format!("failed to decode NRD API JSON response (HTTP {status})")
+                })?;
+            // Official response consumers classify HTTP/business status before
+            // deserializing success data. A revoked device returns data={} rather
+            // than DeviceList; that must not hide its 1120 behind a missing field.
+            let code = if status != reqwest::StatusCode::OK && envelope.code == 0 {
+                i32::from(status.as_u16())
+            } else {
+                envelope.code
+            };
+            if !retried_version && is_version_too_low(code, &envelope.msg) {
+                retried_version = true;
+                self.ensure_client_version(true).await;
+                let refreshed = crate::protocol::official_version::client();
+                if refreshed != sent_version {
+                    tracing::info!(
+                        old = %sent_version,
+                        new = %refreshed,
+                        path,
+                        code,
+                        "retrying NRD API after official client version update"
+                    );
+                    continue;
+                }
+            }
+            break (status, code, envelope);
         };
         let waiting_for_confirmation = assist::is_join(contract) && code == 1136;
         if code != 0 && !waiting_for_confirmation {
@@ -1107,6 +1219,7 @@ impl NrdApi {
 
     fn signed_headers(
         &self,
+        version_name: &str,
         method: &str,
         path: &str,
         body: &[u8],
@@ -1116,7 +1229,7 @@ impl NrdApi {
             .duration_since(UNIX_EPOCH)
             .context("system clock is before the Unix epoch")?
             .as_secs();
-        let pairs = self.common_header_pairs(timestamp, scope);
+        let pairs = self.common_header_pairs(version_name, timestamp, scope);
         let signature = make_signature(method, path, &pairs, body)?;
         let mut headers = HeaderMap::new();
         for (name, value) in pairs {
@@ -1133,18 +1246,19 @@ impl NrdApi {
         Ok(headers)
     }
 
-    fn common_header_pairs(&self, timestamp: u64, scope: IdentityScope) -> Vec<(String, String)> {
+    fn common_header_pairs(
+        &self,
+        version_name: &str,
+        timestamp: u64,
+        scope: IdentityScope,
+    ) -> Vec<(String, String)> {
         let mut pairs = vec![
             ("X-Param-PLAT".into(), "1".into()),
-            ("X-Param-VN".into(), self.version_name.clone()),
+            ("X-Param-VN".into(), version_name.into()),
             // VC is the last component of the version name sent in VN.
             (
                 "X-Param-VC".into(),
-                self.version_name
-                    .rsplit('.')
-                    .next()
-                    .unwrap_or_default()
-                    .into(),
+                version_name.rsplit('.').next().unwrap_or_default().into(),
             ),
             ("X-Param-PKGN".into(), PACKAGE_NAME.into()),
             ("X-Param-CHN".into(), self.channel.clone()),
@@ -1180,7 +1294,7 @@ impl fmt::Debug for NrdApi {
         f.debug_struct("NrdApi")
             .field("endpoints", &"NRD HTTPS primary/backup")
             .field("identity", &self.identity)
-            .field("version_name", &self.version_name)
+            .field("version_name", &crate::protocol::official_version::client())
             .field("channel", &self.channel)
             .field("user_id", &self.user_id.as_ref().map(|_| "***REDACTED***"))
             .field(
@@ -1229,4 +1343,27 @@ fn hex_lower(bytes: &[u8]) -> String {
         output.push(HEX[(byte & 0x0f) as usize] as char);
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_version_too_low_responses() {
+        assert!(is_version_too_low(2007, "控制端版本较低，请更新到最新版后再试"));
+        assert!(is_version_too_low(2008, "被控端版本较低，请更新到最新版后再试"));
+        assert!(is_version_too_low(9999, "客户端版本过低"));
+        assert!(!is_version_too_low(0, ""));
+        assert!(!is_version_too_low(1120, "登录态失效"));
+    }
+
+    #[test]
+    fn header_pairs_derive_vc_from_dynamic_vn() {
+        let identity = ClientIdentity::new("client-1", "0123456789abcdef", "sys-1").unwrap();
+        let api = NrdApi::new(identity).unwrap();
+        let pairs = api.common_header_pairs("4.48.4.6020", 1_700_000_000, IdentityScope::Device);
+        assert!(pairs.iter().any(|(k, v)| k == "X-Param-VN" && v == "4.48.4.6020"));
+        assert!(pairs.iter().any(|(k, v)| k == "X-Param-VC" && v == "6020"));
+    }
 }

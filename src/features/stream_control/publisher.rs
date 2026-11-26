@@ -84,6 +84,7 @@ pub(crate) fn display_request(bytes: &[u8]) -> Result<Option<&'static str>> {
         return Ok(None);
     };
     Ok(match PbRpcRequest::decode(bytes.as_slice())?.payload {
+        Some(PbRpcRequestPayload::UserEntitlementSync(_)) => Some("UserEntitlementSync"),
         Some(PbRpcRequestPayload::CaptureSetting(_)) => Some("CaptureSetting"),
         Some(PbRpcRequestPayload::CreateVirtualDisplay(_)) => Some("CreateVirtualDisplay"),
         Some(PbRpcRequestPayload::RemoveVirtualDisplay(_)) => Some("RemoveVirtualDisplay"),
